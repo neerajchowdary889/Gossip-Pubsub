@@ -140,7 +140,7 @@ func main() {
 	defer h.Close()
 
 	log.Printf("🚀 Node created with ID: %s", h.ID())
-	
+	log.Printf("🔗 Multiaddresses: %v", h.Addrs())
 	// Print addresses
 	printHostAddrs(h)
 
