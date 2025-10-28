@@ -17,7 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 
 	"GossipPubsub/Peer"
-	CRDT "GossipPubsub/crdt"
+	CRDT "GossipPubsub/CRDT"
 )
 
 // Constants are defined in main.go
