@@ -16,8 +16,8 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 
-	"GossipPubsub/Peer"
 	CRDT "GossipPubsub/CRDT"
+	"GossipPubsub/Peer"
 )
 
 // Constants are defined in main.go
@@ -157,6 +157,16 @@ func crdtMain() {
 	defer topic.Close()
 
 	log.Printf("📡 Joined CRDT topic: %s", *CRDTTopic)
+
+	// Wait a moment for peer connections to establish
+	time.Sleep(2 * time.Second)
+
+	// Check peer connections
+	peers := h.Network().Peers()
+	log.Printf("🔗 Connected peers: %d", len(peers))
+	for _, peerID := range peers {
+		log.Printf("   - %s", peerID)
+	}
 
 	// Create CRDT node
 	node := &CRDTNode{
