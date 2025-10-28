@@ -283,6 +283,8 @@ func (n *CRDTNode) startCRDTPublisher() {
 				log.Printf("❌ CRDT Sync error: %v", err)
 			} else {
 				counter++
+				// Show current CRDT content every sync
+				n.printCurrentCRDTContent()
 			}
 		}
 	}
@@ -291,9 +293,10 @@ func (n *CRDTNode) startCRDTPublisher() {
 func (n *CRDTNode) addLocalCRDTData(counter uint64) {
 	// Add data to local CRDT sets and counters
 	nodeID := n.nodeID
+	peerID := nodeID[:8] // Short peer ID for readability
 
 	// Add to sample set
-	element := fmt.Sprintf("node-%s-element-%d", nodeID[:8], counter)
+	element := fmt.Sprintf("node-%s-element-%d", peerID, counter)
 	ts := CRDT.VectorClock{nodeID: counter + 1}
 
 	if err := n.engine.LWWAdd(nodeID, "sample-set", element, ts); err != nil {
@@ -302,11 +305,12 @@ func (n *CRDTNode) addLocalCRDTData(counter uint64) {
 		log.Printf("📝 Added local element: %s", element)
 	}
 
-	// Increment counter
-	if err := n.engine.CounterInc(nodeID, "sample-counter", 1, ts); err != nil {
+	// Increment peer-specific counter
+	counterKey := fmt.Sprintf("%s-counter", peerID)
+	if err := n.engine.CounterInc(nodeID, counterKey, 1, ts); err != nil {
 		log.Printf("⚠️  Failed to increment local counter: %v", err)
 	} else {
-		log.Printf("📝 Incremented local counter")
+		log.Printf("📝 Incremented local counter: %s", counterKey)
 	}
 }
 
@@ -518,6 +522,19 @@ func (n *CRDTNode) printCRDTStats() {
 		case *CRDT.LWWSet:
 			elements, _ := n.engine.GetSet(key)
 			fmt.Printf("  Set '%s':         %d elements\n", key, len(elements))
+			// Show first few elements
+			if len(elements) > 0 {
+				maxShow := 3
+				if len(elements) < maxShow {
+					maxShow = len(elements)
+				}
+				for i := 0; i < maxShow; i++ {
+					fmt.Printf("    [%d] %s\n", i+1, elements[i])
+				}
+				if len(elements) > 3 {
+					fmt.Printf("    ... and %d more\n", len(elements)-3)
+				}
+			}
 		case *CRDT.Counter:
 			value, _ := n.engine.GetCounter(key)
 			fmt.Printf("  Counter '%s':     %d\n", key, value)
@@ -538,7 +555,7 @@ func (n *CRDTNode) printCRDTState() {
 		switch crdt.(type) {
 		case *CRDT.LWWSet:
 			elements, _ := n.engine.GetSet(key)
-			fmt.Printf("\nSet '%s':\n", key)
+			fmt.Printf("\nSet '%s': (%d elements)\n", key, len(elements))
 			for i, element := range elements {
 				fmt.Printf("  [%d] %s\n", i+1, element)
 			}
@@ -551,4 +568,22 @@ func (n *CRDTNode) printCRDTState() {
 	// Print message store
 	n.msgStore.Print()
 	fmt.Println(strings.Repeat("=", 80) + "\n")
+}
+
+// printCurrentCRDTContent shows current CRDT content in a compact format
+func (n *CRDTNode) printCurrentCRDTContent() {
+	allCRDTs := n.engine.GetAllCRDTs()
+
+	fmt.Printf("📋 Current CRDT Content:\n")
+	for key, crdt := range allCRDTs {
+		switch crdt.(type) {
+		case *CRDT.LWWSet:
+			elements, _ := n.engine.GetSet(key)
+			fmt.Printf("  📦 %s: %d elements\n", key, len(elements))
+		case *CRDT.Counter:
+			value, _ := n.engine.GetCounter(key)
+			fmt.Printf("  🔢 %s: %d\n", key, value)
+		}
+	}
+	fmt.Println()
 }
