@@ -317,7 +317,25 @@ func (n *CRDTNode) syncCRDTState() error {
 	// Convert CRDTs to JSON RawMessage for proper serialization
 	syncData := make(map[string]json.RawMessage)
 	for key, crdt := range allCRDTs {
-		data, err := json.Marshal(crdt)
+		// Create a wrapper with type information
+		var wrapper struct {
+			Type string      `json:"type"`
+			Data interface{} `json:"data"`
+		}
+
+		switch crdt.(type) {
+		case *CRDT.LWWSet:
+			wrapper.Type = "lwwset"
+			wrapper.Data = crdt
+		case *CRDT.Counter:
+			wrapper.Type = "counter"
+			wrapper.Data = crdt
+		default:
+			log.Printf("⚠️  Unknown CRDT type for key %s", key)
+			continue
+		}
+
+		data, err := json.Marshal(wrapper)
 		if err != nil {
 			log.Printf("⚠️  Failed to marshal CRDT %s: %v", key, err)
 			continue
@@ -415,22 +433,37 @@ func (n *CRDTNode) applyCRDTSync(msg CRDTMessage) error {
 
 	// Merge each CRDT from the sync message
 	for key, rawData := range msg.SyncData {
-		// Unmarshal the raw JSON data to determine CRDT type
-		var remoteCRDT CRDT.CRDT
+		// Unmarshal the wrapper with type information
+		var wrapper struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
 
-		// Try to unmarshal as LWWSet first
-		var lwwSet CRDT.LWWSet
-		if err := json.Unmarshal(rawData, &lwwSet); err == nil {
-			remoteCRDT = &lwwSet
-		} else {
-			// Try to unmarshal as Counter
+		if err := json.Unmarshal(rawData, &wrapper); err != nil {
+			log.Printf("⚠️  Failed to unmarshal CRDT wrapper %s: %v", key, err)
+			continue
+		}
+
+		// Unmarshal based on type
+		var remoteCRDT CRDT.CRDT
+		switch wrapper.Type {
+		case "counter":
 			var counter CRDT.Counter
-			if err := json.Unmarshal(rawData, &counter); err == nil {
-				remoteCRDT = &counter
-			} else {
-				log.Printf("⚠️  Failed to unmarshal CRDT %s: %v", key, err)
+			if err := json.Unmarshal(wrapper.Data, &counter); err != nil {
+				log.Printf("⚠️  Failed to unmarshal Counter %s: %v", key, err)
 				continue
 			}
+			remoteCRDT = &counter
+		case "lwwset":
+			var lwwSet CRDT.LWWSet
+			if err := json.Unmarshal(wrapper.Data, &lwwSet); err != nil {
+				log.Printf("⚠️  Failed to unmarshal LWWSet %s: %v", key, err)
+				continue
+			}
+			remoteCRDT = &lwwSet
+		default:
+			log.Printf("⚠️  Unknown CRDT type %s for key %s", wrapper.Type, key)
+			continue
 		}
 
 		if ourCRDT, exists := ourCRDTs[key]; exists {
