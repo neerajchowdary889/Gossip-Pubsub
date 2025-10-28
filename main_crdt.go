@@ -293,10 +293,10 @@ func (n *CRDTNode) startCRDTPublisher() {
 func (n *CRDTNode) addLocalCRDTData(counter uint64) {
 	// Add data to local CRDT sets and counters
 	nodeID := n.nodeID
-	peerID := nodeID[:8] // Short peer ID for readability
+	peerID := nodeID[len(nodeID)-6:] // Last 6 letters of peer ID
 
 	// Add to sample set
-	element := fmt.Sprintf("node-%s-element-%d", peerID, counter)
+	element := fmt.Sprintf("%s-%d", peerID, counter)
 	ts := CRDT.VectorClock{nodeID: counter + 1}
 
 	if err := n.engine.LWWAdd(nodeID, "sample-set", element, ts); err != nil {
@@ -373,16 +373,24 @@ func (n *CRDTNode) syncCRDTState() error {
 func (n *CRDTNode) startCRDTSubscriber() {
 	log.Printf("📨 CRDT Subscriber started, listening for messages...")
 
+	// Add a heartbeat to show the subscriber is working
+	heartbeatTicker := time.NewTicker(30 * time.Second)
+	defer heartbeatTicker.Stop()
+
 	for {
 		select {
 		case <-n.ctx.Done():
 			log.Printf("📨 CRDT Subscriber stopping...")
 			return
+		case <-heartbeatTicker.C:
+			// Show heartbeat to indicate subscriber is alive
+			log.Printf("💓 CRDT Subscriber heartbeat - listening for messages...")
 		default:
 			if err := n.receiveCRDTMessage(); err != nil {
 				if n.ctx.Err() != nil {
 					return
 				}
+				// Only log real errors, not timeouts
 				log.Printf("❌ CRDT Subscription error: %v", err)
 				time.Sleep(time.Second)
 			}
@@ -398,7 +406,8 @@ func (n *CRDTNode) receiveCRDTMessage() error {
 	msg, err := n.sub.Next(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err() // Return context error for proper handling
+			// This is a normal timeout, not an error
+			return nil
 		}
 		return fmt.Errorf("failed to receive CRDT message: %w", err)
 	}
