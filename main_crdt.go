@@ -15,6 +15,7 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
 	CRDT "GossipPubsub/CRDT"
 	"GossipPubsub/Peer"
@@ -139,6 +140,12 @@ func crdtMain() {
 		connectToBootstraps(ctx, h, *bootstraps)
 	}
 
+	// Start mDNS discovery for auto-discovery
+	mdnsService := mdns.NewMdnsService(h, "gossip-crdt", nil)
+
+	mdnsService.Start()
+	log.Printf("🔍 mDNS discovery started for auto-discovery")
+
 	// Create CRDT engine
 	engine := CRDT.NewEngineMemOnly(50 * 1024 * 1024) // 50MB heap
 	log.Printf("📊 CRDT Engine initialized with 50MB heap")
@@ -180,27 +187,32 @@ func crdtMain() {
 	}
 
 	// Start components based on mode
-	// Every node is both a publisher and a subscriber
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		node.startCRDTPublisher()
-	}()
-
-	sub, err := topic.Subscribe()
-	if err != nil {
-		log.Fatalf("Failed to subscribe to CRDT topic: %v", err)
+	// Start publisher if mode is "publish" or "both"
+	if *CRDTMode == "publish" || *CRDTMode == "both" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			node.startCRDTPublisher()
+		}()
 	}
-	defer sub.Cancel()
 
-	node.sub = sub
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		node.startCRDTSubscriber()
-	}()
+	// Start subscriber if mode is "subscribe" or "both"
+	if *CRDTMode == "subscribe" || *CRDTMode == "both" {
+		sub, err := topic.Subscribe()
+		if err != nil {
+			log.Fatalf("Failed to subscribe to CRDT topic: %v", err)
+		}
+		defer sub.Cancel()
+
+		node.sub = sub
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			node.startCRDTSubscriber()
+		}()
+	}
 
 	// Print CRDT stats periodically
 	wg.Add(1)
@@ -257,8 +269,9 @@ func crdtMain() {
 	log.Println("👋 CRDT Node goodbye!")
 }
 
-// createCRDTHost reuses the existing createHost function from main.go
+// createCRDTHost creates a unique host for CRDT nodes based on port
 func createCRDTHost(ctx context.Context, port int) (host.Host, error) {
+	// Generate a unique key file for each CRDT node based on port
 	return createHost(ctx, port, "")
 }
 

@@ -134,6 +134,7 @@ var (
 	CRDTPort       = flag.Int("crdtport", defaultCRDTPort, "Port to listen on for CRDT (0 for default)")
 	CRDTTopic      = flag.String("crdttopic", defaultCRDTTopic, "PubSub topic name for CRDT")
 	CRDTInterval   = flag.Duration("crdtinterval", defaultCRDTInterval, "Publishing interval (e.g., 1s, 500ms) for CRDT")
+	CRDTMode       = flag.String("crdtmode", defaultCRDTMode, "CRDT mode: publish, subscribe, or both")
 	CRDTPrintStore = flag.Bool("crdtprint", defaultCRDTPrintStore, "Print message store contents for CRDT")
 )
 
