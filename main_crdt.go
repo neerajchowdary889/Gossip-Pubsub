@@ -164,6 +164,7 @@ func crdtMain() {
 	defer topic.Close()
 
 	log.Printf("📡 Joined CRDT topic: %s", *CRDTTopic)
+	log.Printf("🎯 CRDT Mode: %s", *CRDTMode)
 
 	// Wait a moment for peer connections to establish
 	time.Sleep(2 * time.Second)
@@ -220,6 +221,13 @@ func crdtMain() {
 		defer wg.Done()
 		node.printCRDTStatsPeriodically()
 	}()
+
+	// If we are a subscriber (or both), immediately request a full sync
+	if *CRDTMode == "subscribe" || *CRDTMode == "both" {
+		if err := node.sendSyncRequest(); err != nil {
+			log.Printf("⚠️  Failed to send initial sync request: %v", err)
+		}
+	}
 
 	// Handle print command
 	if *CRDTPrintStore {
@@ -447,6 +455,17 @@ func (n *CRDTNode) receiveCRDTMessage() error {
 		}
 	}
 
+	// Handle sync request: if we can publish, reply with full state
+	if crdtMsg.Type == "sync_request" {
+		if *CRDTMode == "publish" || *CRDTMode == "both" {
+			if err := n.syncCRDTState(); err != nil {
+				log.Printf("⚠️  Failed to respond to sync request: %v", err)
+			} else {
+				log.Printf("📤 Responded to sync request from %s", crdtMsg.NodeID[:8])
+			}
+		}
+	}
+
 	log.Printf("📨 Received CRDT message from %s: %s", crdtMsg.NodeID[:8], crdtMsg.Type)
 	return nil
 }
@@ -608,4 +627,19 @@ func (n *CRDTNode) printCurrentCRDTContent() {
 		}
 	}
 	fmt.Println()
+}
+
+// sendSyncRequest asks peers to publish their full CRDT state immediately
+func (n *CRDTNode) sendSyncRequest() error {
+	msg := CRDTMessage{
+		Type:      "sync_request",
+		NodeID:    n.nodeID,
+		Key:       "request",
+		Timestamp: time.Now(),
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal sync request: %w", err)
+	}
+	return n.topic.Publish(n.ctx, data)
 }
