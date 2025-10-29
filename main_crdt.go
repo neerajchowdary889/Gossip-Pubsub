@@ -2,14 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -18,92 +14,11 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
 	CRDT "GossipPubsub/CRDT"
+	"GossipPubsub/CRDTSync"
 	"GossipPubsub/Peer"
 )
 
 // Constants are defined in main.go
-
-// CRDTMessage represents a message sent over PubSub for CRDT synchronization
-type CRDTMessage struct {
-	Type      string                     `json:"type"` // "operation" or "sync"
-	NodeID    string                     `json:"node_id"`
-	Key       string                     `json:"key"`
-	Operation *CRDTOperation             `json:"operation,omitempty"`
-	SyncData  map[string]json.RawMessage `json:"sync_data,omitempty"`
-	Timestamp time.Time                  `json:"timestamp"`
-}
-
-// CRDTOperation represents a CRDT operation
-type CRDTOperation struct {
-	Kind    string           `json:"kind"` // "add", "remove", "increment"
-	Element string           `json:"element,omitempty"`
-	Value   uint64           `json:"value,omitempty"`
-	TS      CRDT.VectorClock `json:"timestamp"`
-}
-
-// CRDTNode represents a CRDT-enabled node
-type CRDTNode struct {
-	nodeID   string
-	host     host.Host
-	engine   *CRDT.Engine
-	topic    *pubsub.Topic
-	sub      *pubsub.Subscription
-	msgStore *CRDTMessageStore
-	ctx      context.Context
-	cancel   context.CancelFunc
-}
-
-// CRDTMessageStore holds received CRDT messages
-type CRDTMessageStore struct {
-	mu       sync.RWMutex
-	messages map[string]CRDTMessage
-}
-
-func NewCRDTMessageStore() *CRDTMessageStore {
-	return &CRDTMessageStore{
-		messages: make(map[string]CRDTMessage),
-	}
-}
-
-func (ms *CRDTMessageStore) Add(key string, msg CRDTMessage) {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	ms.messages[key] = msg
-}
-
-func (ms *CRDTMessageStore) Print() {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
-
-	fmt.Println("\n" + strings.Repeat("=", 80))
-	fmt.Printf("CRDT MESSAGE STORE - Total: %d messages\n", len(ms.messages))
-	fmt.Println(strings.Repeat("=", 80))
-
-	if len(ms.messages) == 0 {
-		fmt.Println("No CRDT messages received yet.")
-		return
-	}
-
-	for key, msg := range ms.messages {
-		fmt.Printf("\n[%s]\n", key)
-		fmt.Printf("  Type:      %s\n", msg.Type)
-		fmt.Printf("  From:      %s\n", msg.NodeID)
-		fmt.Printf("  Key:       %s\n", msg.Key)
-		fmt.Printf("  Timestamp: %s\n", msg.Timestamp.Format(time.RFC3339Nano))
-
-		if msg.Operation != nil {
-			fmt.Printf("  Operation: %s", msg.Operation.Kind)
-			if msg.Operation.Element != "" {
-				fmt.Printf(" element=%s", msg.Operation.Element)
-			}
-			if msg.Operation.Value > 0 {
-				fmt.Printf(" value=%d", msg.Operation.Value)
-			}
-			fmt.Println()
-		}
-	}
-	fmt.Println(strings.Repeat("=", 80) + "\n")
-}
 
 func crdtMain() {
 	flag.Parse()
@@ -142,7 +57,6 @@ func crdtMain() {
 
 	// Start mDNS discovery for auto-discovery
 	mdnsService := mdns.NewMdnsService(h, "gossip-crdt", nil)
-
 	mdnsService.Start()
 	log.Printf("🔍 mDNS discovery started for auto-discovery")
 
@@ -176,66 +90,32 @@ func crdtMain() {
 		log.Printf("   - %s", peerID)
 	}
 
-	// Create CRDT node
-	node := &CRDTNode{
-		nodeID:   h.ID().String(),
-		host:     h,
-		engine:   engine,
-		topic:    topic,
-		msgStore: NewCRDTMessageStore(),
-		ctx:      ctx,
-		cancel:   cancel,
+	// Create CRDTSync configuration
+	config := &CRDTSync.Config{
+		Mode:              CRDTSync.SyncMode(*CRDTMode),
+		SyncInterval:      *CRDTInterval,
+		TopicName:         *CRDTTopic,
+		PrintStore:        *CRDTPrintStore,
+		HeartbeatInterval: 30 * time.Second,
 	}
 
-	// Start components based on mode
-	var wg sync.WaitGroup
+	// Create CRDT sync node
+	syncNode := CRDTSync.NewNode(h, engine, topic, config)
 
-	// Start publisher if mode is "publish" or "both"
-	if *CRDTMode == "publish" || *CRDTMode == "both" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			node.startCRDTPublisher()
-		}()
+	// Start the sync node
+	if err := syncNode.Start(ctx); err != nil {
+		log.Fatalf("Failed to start CRDT sync: %v", err)
 	}
 
-	// Start subscriber if mode is "subscribe" or "both"
-	if *CRDTMode == "subscribe" || *CRDTMode == "both" {
-		sub, err := topic.Subscribe()
-		if err != nil {
-			log.Fatalf("Failed to subscribe to CRDT topic: %v", err)
-		}
-		defer sub.Cancel()
-
-		node.sub = sub
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			node.startCRDTSubscriber()
-		}()
-	}
-
-	// Print CRDT stats periodically
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		node.printCRDTStatsPeriodically()
-	}()
-
-	// If we are a subscriber (or both), immediately request a full sync
-	if *CRDTMode == "subscribe" || *CRDTMode == "both" {
-		if err := node.sendSyncRequest(); err != nil {
-			log.Printf("⚠️  Failed to send initial sync request: %v", err)
-		}
-	}
+	// Start stats printer
+	syncNode.StartStatsPrinter(30 * time.Second)
 
 	// Handle print command
 	if *CRDTPrintStore {
 		// Wait a bit for messages to arrive, then print and exit
 		time.Sleep(5 * time.Second)
-		node.printCRDTState()
+		syncNode.PrintFinalState()
 		cancel()
-		wg.Wait()
 		return
 	}
 
@@ -253,25 +133,11 @@ func crdtMain() {
 	log.Println("🛑 Shutting down CRDT node...")
 
 	// Print final CRDT state
-	node.printCRDTState()
+	syncNode.PrintFinalState()
 
-	// Cancel context to stop all goroutines
-	cancel()
-
-	// Wait for all goroutines to finish with timeout
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("👋 All goroutines stopped gracefully")
-	case <-time.After(5 * time.Second):
-		log.Println("⚠️  Timeout waiting for goroutines to stop")
-		log.Println("🔄 Force exiting...")
-		os.Exit(0)
+	// Stop the sync node
+	if err := syncNode.Stop(); err != nil {
+		log.Printf("⚠️  Error stopping sync node: %v", err)
 	}
 
 	log.Println("👋 CRDT Node goodbye!")
@@ -281,365 +147,4 @@ func crdtMain() {
 func createCRDTHost(ctx context.Context, port int) (host.Host, error) {
 	// Generate a unique key file for each CRDT node based on port
 	return createHost(ctx, port, "")
-}
-
-func (n *CRDTNode) startCRDTPublisher() {
-	ticker := time.NewTicker(*CRDTInterval)
-	defer ticker.Stop()
-
-	counter := uint64(0)
-	log.Printf("📤 CRDT Publisher started, syncing every %v", *CRDTInterval)
-
-	for {
-		select {
-		case <-n.ctx.Done():
-			log.Printf("📤 CRDT Publisher stopping...")
-			return
-		case <-ticker.C:
-			// Add local data first
-			n.addLocalCRDTData(counter)
-
-			// Then sync the entire CRDT state
-			if err := n.syncCRDTState(); err != nil {
-				log.Printf("❌ CRDT Sync error: %v", err)
-			} else {
-				counter++
-				// Show current CRDT content every sync
-				n.printCurrentCRDTContent()
-			}
-		}
-	}
-}
-
-func (n *CRDTNode) addLocalCRDTData(counter uint64) {
-	// Add data to local CRDT sets and counters
-	nodeID := n.nodeID
-	peerID := nodeID[len(nodeID)-6:] // Last 6 letters of peer ID
-
-	// Add to sample set
-	element := fmt.Sprintf("%s-%d", peerID, counter)
-	ts := CRDT.VectorClock{nodeID: counter + 1}
-
-	if err := n.engine.LWWAdd(nodeID, "sample-set", element, ts); err != nil {
-		log.Printf("⚠️  Failed to add to local set: %v", err)
-	} else {
-		log.Printf("📝 Added local element: %s", element)
-	}
-
-	// Increment peer-specific counter
-	counterKey := fmt.Sprintf("%s-counter", peerID)
-	if err := n.engine.CounterInc(nodeID, counterKey, 1, ts); err != nil {
-		log.Printf("⚠️  Failed to increment local counter: %v", err)
-	} else {
-		log.Printf("📝 Incremented local counter: %s", counterKey)
-	}
-}
-
-func (n *CRDTNode) syncCRDTState() error {
-	// Get all CRDTs from local engine
-	allCRDTs := n.engine.GetAllCRDTs()
-
-	// Convert CRDTs to JSON RawMessage for proper serialization
-	syncData := make(map[string]json.RawMessage)
-	for key, crdt := range allCRDTs {
-		// Create a wrapper with type information
-		var wrapper struct {
-			Type string      `json:"type"`
-			Data interface{} `json:"data"`
-		}
-
-		switch crdt.(type) {
-		case *CRDT.LWWSet:
-			wrapper.Type = "lwwset"
-			wrapper.Data = crdt
-		case *CRDT.Counter:
-			wrapper.Type = "counter"
-			wrapper.Data = crdt
-		default:
-			log.Printf("⚠️  Unknown CRDT type for key %s", key)
-			continue
-		}
-
-		data, err := json.Marshal(wrapper)
-		if err != nil {
-			log.Printf("⚠️  Failed to marshal CRDT %s: %v", key, err)
-			continue
-		}
-		syncData[key] = data
-	}
-
-	// Create sync message
-	msg := CRDTMessage{
-		Type:      "sync",
-		NodeID:    n.nodeID,
-		Key:       "all-crdts",
-		SyncData:  syncData,
-		Timestamp: time.Now(),
-	}
-
-	// Serialize and publish
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal CRDT sync message: %w", err)
-	}
-
-	if err := n.topic.Publish(n.ctx, data); err != nil {
-		return fmt.Errorf("failed to publish CRDT sync message: %w", err)
-	}
-
-	log.Printf("📤 Synced CRDT state: %d objects", len(allCRDTs))
-	return nil
-}
-
-func (n *CRDTNode) startCRDTSubscriber() {
-	log.Printf("📨 CRDT Subscriber started, listening for messages...")
-
-	// Add a heartbeat to show the subscriber is working
-	heartbeatTicker := time.NewTicker(30 * time.Second)
-	defer heartbeatTicker.Stop()
-
-	for {
-		select {
-		case <-n.ctx.Done():
-			log.Printf("📨 CRDT Subscriber stopping...")
-			return
-		case <-heartbeatTicker.C:
-			// Show heartbeat to indicate subscriber is alive
-			log.Printf("💓 CRDT Subscriber heartbeat - listening for messages...")
-		default:
-			if err := n.receiveCRDTMessage(); err != nil {
-				if n.ctx.Err() != nil {
-					return
-				}
-				// Only log real errors, not timeouts
-				log.Printf("❌ CRDT Subscription error: %v", err)
-				time.Sleep(time.Second)
-			}
-		}
-	}
-}
-
-func (n *CRDTNode) receiveCRDTMessage() error {
-	// Create a context with timeout to avoid blocking indefinitely
-	ctx, cancel := context.WithTimeout(n.ctx, 1*time.Second)
-	defer cancel()
-
-	msg, err := n.sub.Next(ctx)
-	if err != nil {
-		if ctx.Err() != nil {
-			// This is a normal timeout, not an error
-			return nil
-		}
-		return fmt.Errorf("failed to receive CRDT message: %w", err)
-	}
-
-	// Parse CRDT message
-	var crdtMsg CRDTMessage
-	if err := json.Unmarshal(msg.Data, &crdtMsg); err != nil {
-		return fmt.Errorf("failed to unmarshal CRDT message: %w", err)
-	}
-
-	// Skip our own messages
-	if crdtMsg.NodeID == n.nodeID {
-		return nil
-	}
-
-	// Store message
-	key := fmt.Sprintf("%s-%d", crdtMsg.NodeID[:8], crdtMsg.Timestamp.UnixNano())
-	n.msgStore.Add(key, crdtMsg)
-
-	// Handle sync messages
-	if crdtMsg.Type == "sync" && crdtMsg.SyncData != nil {
-		if err := n.applyCRDTSync(crdtMsg); err != nil {
-			log.Printf("⚠️  Failed to apply CRDT sync: %v", err)
-		}
-	}
-
-	// Handle sync request: if we can publish, reply with full state
-	if crdtMsg.Type == "sync_request" {
-		if *CRDTMode == "publish" || *CRDTMode == "both" {
-			if err := n.syncCRDTState(); err != nil {
-				log.Printf("⚠️  Failed to respond to sync request: %v", err)
-			} else {
-				log.Printf("📤 Responded to sync request from %s", crdtMsg.NodeID[:8])
-			}
-		}
-	}
-
-	log.Printf("📨 Received CRDT message from %s: %s", crdtMsg.NodeID[:8], crdtMsg.Type)
-	return nil
-}
-
-func (n *CRDTNode) applyCRDTSync(msg CRDTMessage) error {
-	log.Printf("🔄 Applying CRDT sync from %s with %d objects", msg.NodeID[:8], len(msg.SyncData))
-
-	// Get our current CRDTs
-	ourCRDTs := n.engine.GetAllCRDTs()
-
-	// Merge each CRDT from the sync message
-	for key, rawData := range msg.SyncData {
-		// Unmarshal the wrapper with type information
-		var wrapper struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
-		}
-
-		if err := json.Unmarshal(rawData, &wrapper); err != nil {
-			log.Printf("⚠️  Failed to unmarshal CRDT wrapper %s: %v", key, err)
-			continue
-		}
-
-		// Unmarshal based on type
-		var remoteCRDT CRDT.CRDT
-		switch wrapper.Type {
-		case "counter":
-			var counter CRDT.Counter
-			if err := json.Unmarshal(wrapper.Data, &counter); err != nil {
-				log.Printf("⚠️  Failed to unmarshal Counter %s: %v", key, err)
-				continue
-			}
-			remoteCRDT = &counter
-		case "lwwset":
-			var lwwSet CRDT.LWWSet
-			if err := json.Unmarshal(wrapper.Data, &lwwSet); err != nil {
-				log.Printf("⚠️  Failed to unmarshal LWWSet %s: %v", key, err)
-				continue
-			}
-			remoteCRDT = &lwwSet
-		default:
-			log.Printf("⚠️  Unknown CRDT type %s for key %s", wrapper.Type, key)
-			continue
-		}
-
-		if ourCRDT, exists := ourCRDTs[key]; exists {
-			// Both nodes have this CRDT - merge them
-			mergedCRDT, err := ourCRDT.Merge(remoteCRDT)
-			if err != nil {
-				log.Printf("⚠️  Failed to merge CRDT %s: %v", key, err)
-				continue
-			}
-
-			// Apply the merged result
-			n.engine.ApplyMergedCRDT(key, mergedCRDT)
-			log.Printf("✅ Merged CRDT %s", key)
-		} else {
-			// We don't have this CRDT - just apply it
-			n.engine.ApplyMergedCRDT(key, remoteCRDT)
-			log.Printf("✅ Applied new CRDT %s", key)
-		}
-	}
-
-	return nil
-}
-
-func (n *CRDTNode) printCRDTStatsPeriodically() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-n.ctx.Done():
-			return
-		case <-ticker.C:
-			n.printCRDTStats()
-		}
-	}
-}
-
-func (n *CRDTNode) printCRDTStats() {
-	peers := n.host.Network().Peers()
-
-	fmt.Println("\n" + strings.Repeat("─", 80))
-	fmt.Println("📊 CRDT PERFORMANCE STATS")
-	fmt.Println(strings.Repeat("─", 80))
-	fmt.Printf("Connected Peers:    %d\n", len(peers))
-
-	// Get CRDT state
-	allCRDTs := n.engine.GetAllCRDTs()
-	fmt.Printf("CRDT Objects:       %d\n", len(allCRDTs))
-
-	for key, crdt := range allCRDTs {
-		switch crdt.(type) {
-		case *CRDT.LWWSet:
-			elements, _ := n.engine.GetSet(key)
-			fmt.Printf("  Set '%s':         %d elements\n", key, len(elements))
-			// Show first few elements
-			if len(elements) > 0 {
-				maxShow := 3
-				if len(elements) < maxShow {
-					maxShow = len(elements)
-				}
-				for i := 0; i < maxShow; i++ {
-					fmt.Printf("    [%d] %s\n", i+1, elements[i])
-				}
-				if len(elements) > 3 {
-					fmt.Printf("    ... and %d more\n", len(elements)-3)
-				}
-			}
-		case *CRDT.Counter:
-			value, _ := n.engine.GetCounter(key)
-			fmt.Printf("  Counter '%s':     %d\n", key, value)
-		}
-	}
-
-	fmt.Println(strings.Repeat("─", 80) + "\n")
-}
-
-func (n *CRDTNode) printCRDTState() {
-	fmt.Println("\n" + strings.Repeat("=", 80))
-	fmt.Println("📊 FINAL CRDT STATE")
-	fmt.Println(strings.Repeat("=", 80))
-
-	// Print CRDT objects
-	allCRDTs := n.engine.GetAllCRDTs()
-	for key, crdt := range allCRDTs {
-		switch crdt.(type) {
-		case *CRDT.LWWSet:
-			elements, _ := n.engine.GetSet(key)
-			fmt.Printf("\nSet '%s': (%d elements)\n", key, len(elements))
-			for i, element := range elements {
-				fmt.Printf("  [%d] %s\n", i+1, element)
-			}
-		case *CRDT.Counter:
-			value, _ := n.engine.GetCounter(key)
-			fmt.Printf("\nCounter '%s': %d\n", key, value)
-		}
-	}
-
-	// Print message store
-	n.msgStore.Print()
-	fmt.Println(strings.Repeat("=", 80) + "\n")
-}
-
-// printCurrentCRDTContent shows current CRDT content in a compact format
-func (n *CRDTNode) printCurrentCRDTContent() {
-	allCRDTs := n.engine.GetAllCRDTs()
-
-	fmt.Printf("📋 Current CRDT Content:\n")
-	for key, crdt := range allCRDTs {
-		switch crdt.(type) {
-		case *CRDT.LWWSet:
-			elements, _ := n.engine.GetSet(key)
-			fmt.Printf("  📦 %s: %d elements\n", key, len(elements))
-		case *CRDT.Counter:
-			value, _ := n.engine.GetCounter(key)
-			fmt.Printf("  🔢 %s: %d\n", key, value)
-		}
-	}
-	fmt.Println()
-}
-
-// sendSyncRequest asks peers to publish their full CRDT state immediately
-func (n *CRDTNode) sendSyncRequest() error {
-	msg := CRDTMessage{
-		Type:      "sync_request",
-		NodeID:    n.nodeID,
-		Key:       "request",
-		Timestamp: time.Now(),
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal sync request: %w", err)
-	}
-	return n.topic.Publish(n.ctx, data)
 }
