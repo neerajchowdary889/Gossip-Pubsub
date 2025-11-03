@@ -20,6 +20,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 
+	"GossipPubsub/Peer"
 	"GossipPubsub/Publisher"
 	"GossipPubsub/Subscriber"
 )
@@ -27,6 +28,13 @@ import (
 const (
 	defaultTopic    = "gossip-performance-test"
 	defaultInterval = 1 * time.Second
+
+	// CRDT constants
+	defaultCRDTTopic      = "crdt-topic"
+	defaultCRDTInterval   = 7 * time.Second
+	defaultCRDTPort       = 4010
+	defaultCRDTMode       = "both"
+	defaultCRDTPrintStore = false
 )
 
 // MessageStore holds received messages in a thread-safe hashtable
@@ -112,18 +120,32 @@ func (ms *MessageStore) GetStats() map[string]interface{} {
 
 // CLI flags
 var (
-	mode         = flag.String("mode", "both", "Mode: publisher, subscriber, or both")
-	port         = flag.Int("port", 0, "Port to listen on (0 for random)")
-	bootstraps   = flag.String("bootstrap", "", "Comma-separated list of bootstrap peers (multiaddr format)")
-	topicName    = flag.String("topic", defaultTopic, "PubSub topic name")
+	mode            = flag.String("mode", "both", "Mode: publisher, subscriber, or both")
+	port            = flag.Int("port", 0, "Port to listen on (0 for random)")
+	bootstraps      = flag.String("bootstrap", "", "Comma-separated list of bootstrap peers (multiaddr format)")
+	topicName       = flag.String("topic", defaultTopic, "PubSub topic name")
 	publishInterval = flag.Duration("interval", defaultInterval, "Publishing interval (e.g., 1s, 500ms)")
-	showAddrs    = flag.Bool("addrs", false, "Show node addresses and exit")
-	printStore   = flag.Bool("print", false, "Print message store contents")
-	keyFile      = flag.String("key", "", "Path to private key file (generates new if not exists)")
+	showAddrs       = flag.Bool("addrs", false, "Show node addresses and exit")
+	printStore      = flag.Bool("print", false, "Print message store contents")
+	keyFile         = flag.String("key", "", "Path to private key file (generates new if not exists)")
+
+	// CRDT flags
+	startCRDT      = flag.Bool("crdt", false, "Start CRDT")
+	CRDTPort       = flag.Int("crdtport", defaultCRDTPort, "Port to listen on for CRDT (0 for default)")
+	CRDTTopic      = flag.String("crdttopic", defaultCRDTTopic, "PubSub topic name for CRDT")
+	CRDTInterval   = flag.Duration("crdtinterval", defaultCRDTInterval, "Publishing interval (e.g., 1s, 500ms) for CRDT")
+	CRDTMode       = flag.String("crdtmode", defaultCRDTMode, "CRDT mode: publish, subscribe, or both")
+	CRDTPrintStore = flag.Bool("crdtprint", defaultCRDTPrintStore, "Print message store contents for CRDT")
 )
 
 func main() {
 	flag.Parse()
+
+	// Check if CRDT mode is enabled
+	if *startCRDT {
+		crdtMain()
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -141,6 +163,14 @@ func main() {
 
 	log.Printf("🚀 Node created with ID: %s", h.ID())
 	log.Printf("🔗 Multiaddresses: %v", h.Addrs())
+
+	// Load and display the PeerID from Peer package
+	if peerID, err := Peer.LoadPeerID(); err == nil {
+		log.Printf("📋 PeerID from Peer package: %s", peerID)
+	} else {
+		log.Printf("⚠️  Could not load PeerID from Peer package: %v", err)
+	}
+
 	// Print addresses
 	printHostAddrs(h)
 
@@ -218,10 +248,10 @@ func main() {
 	log.Println("✅ Node running. Press Ctrl+C to stop.")
 	<-sigCh
 	log.Println("🛑 Shutting down...")
-	
+
 	// Print final stats
 	msgStore.Print()
-	
+
 	cancel()
 	wg.Wait()
 	log.Println("👋 Goodbye!")
@@ -231,16 +261,26 @@ func createHost(ctx context.Context, port int, keyFile string) (host.Host, error
 	var priv crypto.PrivKey
 	var err error
 
-	// Load or generate key
+	// Load or generate key using Peer package
 	if keyFile != "" {
 		priv, err = loadOrGenerateKey(keyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load/generate key: %w", err)
 		}
 	} else {
-		priv, _, err = crypto.GenerateKeyPairWithReader(crypto.Ed25519, 2048, rand.Reader)
+		// Use Peer package to load/create private key
+		priv, err = Peer.LoadPrivateKey()
 		if err != nil {
-			return nil, fmt.Errorf("failed to generate key: %w", err)
+			// If loading fails, create a new peer ID and get its private key
+			_, err := Peer.CreatePeerID()
+			if err != nil {
+				return nil, fmt.Errorf("failed to create peer ID: %w", err)
+			}
+			// Now load the newly created private key
+			priv, err = Peer.LoadPrivateKey()
+			if err != nil {
+				return nil, fmt.Errorf("failed to load newly created private key: %w", err)
+			}
 		}
 	}
 
@@ -293,11 +333,11 @@ func printHostAddrs(h host.Host) {
 
 func connectToBootstraps(ctx context.Context, h host.Host, bootstrapStr string) {
 	log.Printf("🔗 Connecting to bootstrap peers...")
-	
+
 	// Parse bootstrap addresses (comma-separated)
 	// Format: /ip4/1.2.3.4/tcp/4001/p2p/QmPeerId
 	addrs := parseMultiaddrs(bootstrapStr)
-	
+
 	for _, addr := range addrs {
 		peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
 		if err != nil {
@@ -315,10 +355,10 @@ func connectToBootstraps(ctx context.Context, h host.Host, bootstrapStr string) 
 
 func parseMultiaddrs(addrsStr string) []multiaddr.Multiaddr {
 	var result []multiaddr.Multiaddr
-	
+
 	// Split by comma
 	parts := splitAndTrim(addrsStr, ",")
-	
+
 	for _, part := range parts {
 		addr, err := multiaddr.NewMultiaddr(part)
 		if err != nil {
@@ -327,7 +367,7 @@ func parseMultiaddrs(addrsStr string) []multiaddr.Multiaddr {
 		}
 		result = append(result, addr)
 	}
-	
+
 	return result
 }
 
@@ -346,7 +386,7 @@ func split(s, sep string) []string {
 	// Simple string split implementation
 	var result []string
 	start := 0
-	
+
 	for i := 0; i < len(s); i++ {
 		if i+len(sep) <= len(s) && s[i:i+len(sep)] == sep {
 			result = append(result, s[start:i])
@@ -361,20 +401,20 @@ func split(s, sep string) []string {
 func trim(s string) string {
 	start := 0
 	end := len(s)
-	
+
 	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n') {
 		start++
 	}
 	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n') {
 		end--
 	}
-	
+
 	return s[start:end]
 }
 
 func startSubscriberWithStore(ctx context.Context, sub *pubsub.Subscription, store *MessageStore) {
 	subscriber := Subscriber.NewSubscriber(sub)
-	
+
 	log.Printf("📨 Subscriber started with message store...")
 
 	for {
@@ -438,12 +478,12 @@ func printStats(h host.Host, store *MessageStore) {
 	fmt.Printf("Connected Peers:    %d\n", len(peers))
 	fmt.Printf("Messages Received:  %d\n", stats["total_messages"])
 	fmt.Printf("Unique Senders:     %d\n", stats["unique_peers"])
-	
+
 	if stats["total_messages"].(int) > 0 {
 		fmt.Printf("Time Span:          %v\n", stats["time_span"])
 		fmt.Printf("Oldest Message:     %v\n", stats["oldest_message"].(time.Time).Format(time.RFC3339))
 		fmt.Printf("Newest Message:     %v\n", stats["newest_message"].(time.Time).Format(time.RFC3339))
 	}
-	
+
 	fmt.Println(strings.Repeat("─", 80) + "\n")
 }
